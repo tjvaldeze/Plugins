@@ -12,6 +12,16 @@ set -e
 # Format an ISO8601 timestamp as "Mon DD, HH:MM UTC"
 fmt_date() { date -d "$1" -u +"%b %d %Y, %H:%M UTC" 2>/dev/null || echo "$1"; }
 
+# Encode a string for use in a shields.io badge path segment
+# spaces -> _, underscores -> __, hyphens -> --
+shields_encode() {
+  local s="$1"
+  s="${s//_/__}"
+  s="${s//-/--}"
+  s="${s// /_}"
+  printf '%s' "$s"
+}
+
 # Render a full plugin block (used in second pass)
 render_plugin() {
   local is_deprecated=$1
@@ -28,6 +38,8 @@ render_plugin() {
   local license=${12}
   local min_dispatcharr=${13}
   local max_dispatcharr=${14}
+  local repo_url=${15}
+  local discord_thread=${16}
 
   local zip_url="https://github.com/${GITHUB_REPOSITORY}/raw/$RELEASES_BRANCH/zips/${plugin_name}/${plugin_name}-latest.zip"
   local source_url="https://github.com/${GITHUB_REPOSITORY}/tree/$SOURCE_BRANCH/plugins/${plugin_name}"
@@ -47,20 +59,34 @@ render_plugin() {
   echo ""
   echo "$description"
   echo ""
+  # Build badges (license, discord, repo)
+  local discord_link="$discord_thread"
+  local badges=""
   if [[ -n "$license" ]]; then
-    echo "**License:** [$license](https://spdx.org/licenses/${license}.html)"
+    badges="[![License: $license](https://img.shields.io/badge/License-$(shields_encode "$license")-blue?style=flat-square)](https://spdx.org/licenses/${license}.html)"
+  fi
+  if [[ -n "$discord_link" ]]; then
+    [[ -n "$badges" ]] && badges+=" "
+    badges+="[![Discord](https://img.shields.io/badge/Discord-Discussion-5865F2?style=flat-square&logo=discord&logoColor=white)]($discord_link)"
+  fi
+  if [[ -n "$repo_url" ]]; then
+    [[ -n "$badges" ]] && badges+=" "
+    badges+="[![Repository](https://img.shields.io/badge/GitHub-Repository-181717?style=flat-square&logo=github&logoColor=white)]($repo_url)"
+  fi
+  if [[ -n "$badges" ]]; then
+    echo "$badges"
     echo ""
   fi
   if [[ -n "$min_dispatcharr" || -n "$max_dispatcharr" ]]; then
-    compat=""
-    if [[ -n "$min_dispatcharr" && -n "$max_dispatcharr" ]]; then
-      compat="$min_dispatcharr – $max_dispatcharr"
-    elif [[ -n "$min_dispatcharr" ]]; then
-      compat="$min_dispatcharr+"
-    else
-      compat="up to $max_dispatcharr"
+    compat_badges=""
+    if [[ -n "$min_dispatcharr" ]]; then
+      compat_badges="![Dispatcharr min](https://img.shields.io/badge/Dispatcharr_min-$(shields_encode "$min_dispatcharr")-brightgreen?style=flat-square)"
     fi
-    echo "**Dispatcharr Compatibility:** $compat"
+    if [[ -n "$max_dispatcharr" ]]; then
+      [[ -n "$compat_badges" ]] && compat_badges+=" "
+      compat_badges+="![Dispatcharr max](https://img.shields.io/badge/Dispatcharr_max-$(shields_encode "$max_dispatcharr")-orange?style=flat-square)"
+    fi
+    echo "$compat_badges"
     echo ""
   fi
   echo "**Downloads:**"
@@ -148,10 +174,12 @@ render_plugin() {
     plugin_license=$(jq -r '.license // ""' "$plugin_file")
     min_dispatcharr=$(jq -r '.min_dispatcharr_version // empty' "$plugin_file")
     max_dispatcharr=$(jq -r '.max_dispatcharr_version // empty' "$plugin_file")
+    repo_url=$(jq -r '.repo_url // ""' "$plugin_file")
+    discord_thread=$(jq -r '.discord_thread // ""' "$plugin_file")
 
     render_plugin "false" "$plugin_name" "$name" "$version" "$author" "$description" \
       "$maintainers" "$last_updated" "$commit_sha" "$commit_sha_short" "$version_count" "$plugin_license" \
-      "$min_dispatcharr" "$max_dispatcharr"
+      "$min_dispatcharr" "$max_dispatcharr" "$repo_url" "$discord_thread"
   done
 
   # Deprecated section (only if any exist)
@@ -195,10 +223,12 @@ render_plugin() {
       plugin_license=$(jq -r '.license // ""' "$plugin_file")
       min_dispatcharr=$(jq -r '.min_dispatcharr_version // empty' "$plugin_file")
       max_dispatcharr=$(jq -r '.max_dispatcharr_version // empty' "$plugin_file")
+      repo_url=$(jq -r '.repo_url // ""' "$plugin_file")
+      discord_thread=$(jq -r '.discord_thread // ""' "$plugin_file")
 
       render_plugin "true" "$plugin_name" "$name" "$version" "$author" "$description" \
         "$maintainers" "$last_updated" "$commit_sha" "$commit_sha_short" "$version_count" "$plugin_license" \
-        "$min_dispatcharr" "$max_dispatcharr"
+        "$min_dispatcharr" "$max_dispatcharr" "$repo_url" "$discord_thread"
     done
   fi
 

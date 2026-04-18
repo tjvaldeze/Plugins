@@ -41,7 +41,7 @@ _scheduler_lock = threading.Lock()  # Prevent concurrent scheduler starts
 class PluginConfig:
     """Centralized configuration constants for Event Channel Managarr."""
 
-    PLUGIN_VERSION = "0.7.0"
+    PLUGIN_VERSION = "1.26.1081615"
 
     # Default timezone for scheduling
     DEFAULT_TIMEZONE = "America/Chicago"
@@ -50,7 +50,7 @@ class PluginConfig:
     DEFAULT_NAME_SOURCE = "Channel_Name"  # Options: "Channel_Name" or "Stream_Name"
 
     # Default hide rules priority (comma-separated)
-    DEFAULT_HIDE_RULES = "[InactiveRegex],[BlankName],[WrongDayOfWeek],[NoEventPattern],[EmptyPlaceholder],[PastDate:0],[FutureDate:2],[ShortDescription],[ShortChannelName]"
+    DEFAULT_HIDE_RULES = "[InactiveRegex],[BlankName],[WrongDayOfWeek],[NoEventPattern],[EmptyPlaceholder],[PastDate:0],[FutureDate:2],[UndatedAge:2],[ShortDescription],[ShortChannelName]"
 
     # Default duplicate handling strategy
     DEFAULT_DUPLICATE_STRATEGY = "lowest_number"  # Options: "lowest_number", "highest_number", "longest_name"
@@ -67,6 +67,14 @@ class PluginConfig:
     # Default keep duplicates setting
     DEFAULT_KEEP_DUPLICATES = False
 
+    # Managed Dummy EPG feature defaults
+    DEFAULT_MANAGE_DUMMY_EPG = False
+    DEFAULT_EVENT_DURATION_HOURS = "3"
+    DEFAULT_DUMMY_EPG_TIMEZONE = "US/Eastern"
+
+    # Pacing for per-channel ORM writes ("none", "low", "medium", "high")
+    DEFAULT_RATE_LIMITING = "none"
+
     # Version check interval (in seconds)
     VERSION_CHECK_INTERVAL = 86400  # 24 hours
 
@@ -82,6 +90,7 @@ class PluginConfig:
     SETTINGS_FILE = "/data/event_channel_managarr_settings.json"
     RESULTS_FILE = "/data/event_channel_managarr_results.json"
     VERSION_CHECK_FILE = "/data/event_channel_managarr_version_check.json"
+    UNDATED_FIRST_SEEN_FILE = "/data/event_channel_managarr_undated_first_seen.json"
     EXPORTS_DIR = "/data/exports"
 
     # GitHub repo for version checks
@@ -147,6 +156,36 @@ class ProgressTracker:
             return f"{h}h {m}m"
 
 
+class SmartRateLimiter:
+    """Optional per-item pacing for bulk ORM loops.
+
+    Sleeps a configurable amount between .wait() calls. Usage:
+        limiter = SmartRateLimiter(settings.get("rate_limiting", "none"))
+        for item in items:
+            ... do one ORM op ...
+            limiter.wait()
+    """
+
+    _DELAYS = {
+        "none": 0.0,
+        "low": 0.05,
+        "medium": 0.2,
+        "high": 0.5,
+    }
+
+    def __init__(self, level):
+        level_str = str(level).strip().lower() if level is not None else "none"
+        self.delay = self._DELAYS.get(level_str, 0.0)
+        self.level = level_str if level_str in self._DELAYS else "none"
+
+    def wait(self):
+        if self.delay > 0:
+            time.sleep(self.delay)
+
+    def is_active(self):
+        return self.delay > 0
+
+
 def _read_last_run():
     """Read the last-run tracker from disk (shared across all uwsgi workers)."""
     try:
@@ -186,6 +225,10 @@ class Plugin:
     DEFAULT_AUTO_REMOVE_EPG = PluginConfig.DEFAULT_AUTO_REMOVE_EPG
     DEFAULT_SCHEDULED_CSV_EXPORT = PluginConfig.DEFAULT_SCHEDULED_CSV_EXPORT
     DEFAULT_KEEP_DUPLICATES = PluginConfig.DEFAULT_KEEP_DUPLICATES
+    DEFAULT_MANAGE_DUMMY_EPG = PluginConfig.DEFAULT_MANAGE_DUMMY_EPG
+    DEFAULT_EVENT_DURATION_HOURS = PluginConfig.DEFAULT_EVENT_DURATION_HOURS
+    DEFAULT_DUMMY_EPG_TIMEZONE = PluginConfig.DEFAULT_DUMMY_EPG_TIMEZONE
+    DEFAULT_RATE_LIMITING = PluginConfig.DEFAULT_RATE_LIMITING
     VERSION_CHECK_INTERVAL = PluginConfig.VERSION_CHECK_INTERVAL
     SCHEDULER_CHECK_INTERVAL = PluginConfig.SCHEDULER_CHECK_INTERVAL
     SCHEDULER_STOP_TIMEOUT = PluginConfig.SCHEDULER_STOP_TIMEOUT
@@ -278,115 +321,166 @@ class Plugin:
                 "type": "info",
                 "help_text": version_message
             },
-        {
-            "id": "timezone",
-            "label": "🌍 Timezone",
-            "type": "select",
-            "default": self.DEFAULT_TIMEZONE,
-            "help_text": "Timezone for scheduled runs. Select the timezone for scheduling. Only one can be selected.",
-            "options": self._load_timezones_from_file()
-        },
-        {
-            "id": "channel_profile_name",
-            "label": "📺 Channel Profile Names (Required)",
-            "type": "string",
-            "default": "",
-            "placeholder": "PPV Events Profile, Sports Profile",
-            "help_text": "REQUIRED: Channel Profile(s) containing channels to monitor. Use comma-separated names for multiple profiles.",
-        },
-        {
-            "id": "channel_groups",
-            "label": "📂 Channel Groups (comma-separated)",
-            "type": "string",
-            "default": "",
-            "placeholder": "PPV Events, Live Events",
-            "help_text": "Specific channel groups to monitor within the profile. Leave blank to monitor all groups in the profile.",
-        },
-        {
-            "id": "name_source",
-            "label": "Name Source",
-            "type": "select",
-            "default": self.DEFAULT_NAME_SOURCE,
-            "help_text": "Select the source of the names to monitor. Only one can be selected.",
-            "options": [
-                {"label": "Channel Name", "value": "Channel_Name"},
-                {"label": "Stream Name", "value": "Stream_Name"}
-            ]
-        },
-        {
-            "id": "hide_rules_priority",
-            "label": "📜 Hide Rules Priority",
-            "type": "string",
-            "default": self.DEFAULT_HIDE_RULES,
-            "placeholder": "[BlankName],[NoEventPattern],[EmptyPlaceholder],[PastDate:0],[FutureDate:2],[ShortDescription],[ShortChannelName]",
-            "help_text": "Define rules for hiding channels in priority order (first match wins). Comma-separated tags. Available tags: [NoEPG], [BlankName], [WrongDayOfWeek], [NoEventPattern], [EmptyPlaceholder], [ShortDescription], [ShortChannelName], [NumberOnly], [PastDate:days], [PastDate:days:Xh], [FutureDate:days], [InactiveRegex]. Example: [PastDate:0] hides if event date has passed, [PastDate:0:4h] adds 4 hour grace period, [NumberOnly] hides channels with just prefix+number like 'PPV 12'.",
-        },
-        {
-            "id": "regex_channels_to_ignore",
-            "label": "🚫 Regex: Channel Names to Ignore",
-            "type": "string",
-            "default": "",
-            "placeholder": "^BACKUP|^TEST",
-            "help_text": "Regular expression to match channel names that should be skipped entirely. Matching channels will not be processed.",
-        },
-        {
-            "id": "regex_mark_inactive",
-            "label": "💤 Regex: Mark Channel as Inactive",
-            "type": "string",
-            "default": "",
-            "placeholder": "PLACEHOLDER|TBD|COMING SOON",
-            "help_text": "Regular expression to hide channels. This is processed as part of the [InactiveRegex] hide rule.",
-        },
-        {
-            "id": "regex_force_visible",
-            "label": "✅ Regex: Force Visible Channels",
-            "type": "string",
-            "default": "",
-            "placeholder": "^NEWS|^WEATHER",
-            "help_text": "Regular expression to match channel names that should ALWAYS be visible, overriding any hide rules.",
-        },
-        {
-            "id": "duplicate_strategy",
-            "label": "🎭 Duplicate Handling Strategy",
-            "type": "select",
-            "default": self.DEFAULT_DUPLICATE_STRATEGY,
-            "help_text": "Strategy to use when multiple channels have the same event.",
-            "options": [
-                {"label": "Keep Lowest Channel Number", "value": "lowest_number"},
-                {"label": "Keep Highest Channel Number", "value": "highest_number"},
-                {"label": "Keep Longest Channel Name", "value": "longest_name"}
-            ]
-        },
-        {
-            "id": "keep_duplicates",
-            "label": "🔄 Keep Duplicate Channels",
-            "type": "boolean",
-            "default": self.DEFAULT_KEEP_DUPLICATES,
-            "help_text": "If enabled, duplicate channels will be kept visible instead of being hidden. The duplicate strategy above will be ignored.",
-        },
-        {
-            "id": "past_date_grace_hours",
-            "label": "📅 Past Date Grace Period (Hours)",
-            "type": "string",
-            "default": self.DEFAULT_PAST_DATE_GRACE_HOURS,
-            "placeholder": "e.g., 6",
-            "help_text": "Hours to wait after midnight before hiding past events. Useful for events that run late.",
-        },
-        {
-            "id": "auto_set_dummy_epg_on_hide",
-            "label": "🔌 Auto-Remove EPG on Hide",
-            "type": "boolean",
-            "default": self.DEFAULT_AUTO_REMOVE_EPG,
-            "help_text": "If enabled, automatically removes EPG data from a channel when it is hidden by the plugin.",
-        },
-        {
-            "id": "scheduled_times",
-            "label": "⏰ Scheduled Run Times (24-hour format)",
-            "type": "string",
-            "default": "",
-            "placeholder": "0600,1300,1800",
-            "help_text": "Comma-separated times to run automatically each day (24-hour format). Example: 0600,1300,1800 runs at 6 AM, 1 PM, and 6 PM daily. Leave blank to disable scheduling.",
-        },
+            {
+                "id": "_section_scope",
+                "label": "📍 Scope",
+                "type": "info",
+                "description": "Which channels this plugin monitors and how it identifies them."
+            },
+            {
+                "id": "timezone",
+                "label": "🌍 Timezone",
+                "type": "select",
+                "default": self.DEFAULT_TIMEZONE,
+                "help_text": "Timezone for scheduled runs. Select the timezone for scheduling. Only one can be selected.",
+                "options": self._load_timezones_from_file()
+            },
+            {
+                "id": "channel_profile_name",
+                "label": "📺 Channel Profile Names (Required)",
+                "type": "text",
+                "default": "",
+                "placeholder": "e.g. All, Favorites",
+                "help_text": "REQUIRED: Channel Profile(s) containing channels to monitor. Use comma-separated names for multiple profiles.",
+            },
+            {
+                "id": "channel_groups",
+                "label": "📂 Channel Groups",
+                "type": "text",
+                "default": "",
+                "placeholder": "e.g. PPV Live Events, Sports",
+                "help_text": "Specific channel groups to monitor within the profile. Leave blank to monitor all groups in the profile.",
+            },
+            {
+                "id": "name_source",
+                "label": "🔤 Name Source",
+                "type": "select",
+                "default": self.DEFAULT_NAME_SOURCE,
+                "help_text": "Select the source of the names to monitor. Only one can be selected.",
+                "options": [
+                    {"label": "Channel Name", "value": "Channel_Name"},
+                    {"label": "Stream Name", "value": "Stream_Name"}
+                ]
+            },
+            {
+                "id": "_section_rules",
+                "label": "🎯 Hide Rules",
+                "type": "info",
+                "description": "Priority-ordered rules that decide which channels to hide."
+            },
+            {
+                "id": "hide_rules_priority",
+                "label": "📜 Hide Rules Priority",
+                "type": "text",
+                "default": self.DEFAULT_HIDE_RULES,
+                "placeholder": "[BlankName],[NoEventPattern],[EmptyPlaceholder],[PastDate:0],[FutureDate:2],[UndatedAge:2],[ShortDescription],[ShortChannelName]",
+                "help_text": "Define rules for hiding channels in priority order (first match wins). Comma-separated tags. Available tags: [NoEPG], [BlankName], [WrongDayOfWeek], [NoEventPattern], [EmptyPlaceholder], [ShortDescription], [ShortChannelName], [NumberOnly], [PastDate:days], [PastDate:days:Xh], [FutureDate:days], [UndatedAge:days], [InactiveRegex].",
+            },
+            {
+                "id": "regex_channels_to_ignore",
+                "label": "🚫 Regex: Channel Names to Ignore",
+                "type": "text",
+                "default": "",
+                "placeholder": "^BACKUP|^TEST",
+                "help_text": "Regular expression to match channel names that should be skipped entirely. Matching channels will not be processed.",
+            },
+            {
+                "id": "regex_mark_inactive",
+                "label": "💤 Regex: Mark Channel as Inactive",
+                "type": "text",
+                "default": "",
+                "placeholder": "CANCELLED|COMING SOON|^TEST|^BACKUP|PLACEHOLDER",
+                "help_text": "Regular expression to hide channels. This is processed as part of the [InactiveRegex] hide rule.",
+            },
+            {
+                "id": "regex_force_visible",
+                "label": "✅ Regex: Force Visible Channels",
+                "type": "text",
+                "default": "",
+                "placeholder": "^NEWS|^WEATHER",
+                "help_text": "Regular expression to match channel names that should ALWAYS be visible, overriding any hide rules.",
+            },
+            {
+                "id": "past_date_grace_hours",
+                "label": "📅 Past Date Grace Period (Hours)",
+                "type": "number",
+                "default": int(self.DEFAULT_PAST_DATE_GRACE_HOURS),
+                "help_text": "Hours to wait after midnight before hiding past events. Useful for events that run late.",
+            },
+            {
+                "id": "_section_duplicates",
+                "label": "🎭 Duplicates",
+                "type": "info",
+                "description": "How to handle channels whose events collide."
+            },
+            {
+                "id": "duplicate_strategy",
+                "label": "🎭 Duplicate Handling Strategy",
+                "type": "select",
+                "default": self.DEFAULT_DUPLICATE_STRATEGY,
+                "help_text": "Strategy to use when multiple channels have the same event.",
+                "options": [
+                    {"label": "Keep Lowest Channel Number", "value": "lowest_number"},
+                    {"label": "Keep Highest Channel Number", "value": "highest_number"},
+                    {"label": "Keep Longest Channel Name", "value": "longest_name"}
+                ]
+            },
+            {
+                "id": "keep_duplicates",
+                "label": "🔄 Keep Duplicate Channels",
+                "type": "boolean",
+                "default": self.DEFAULT_KEEP_DUPLICATES,
+                "help_text": "If enabled, duplicate channels will be kept visible instead of being hidden. The duplicate strategy above will be ignored.",
+            },
+            {
+                "id": "_section_epg",
+                "label": "🔌 EPG Management",
+                "type": "info",
+                "description": "Optional automation for EPG assignment on visibility changes and a managed dummy EPG for channels without real EPG."
+            },
+            {
+                "id": "auto_set_dummy_epg_on_hide",
+                "label": "🔌 Auto-Remove EPG on Hide",
+                "type": "boolean",
+                "default": self.DEFAULT_AUTO_REMOVE_EPG,
+                "help_text": "If enabled, automatically removes EPG data from a channel when it is hidden by the plugin.",
+            },
+            {
+                "id": "manage_dummy_epg",
+                "label": "🗓️ Manage Dummy EPG",
+                "type": "boolean",
+                "default": self.DEFAULT_MANAGE_DUMMY_EPG,
+                "help_text": "If enabled, visible channels with no EPG assigned will be bound to a plugin-managed dummy EPG source. The guide shows the extracted event during its time window (and 'Offline' outside it), or the channel name as a 24-hour fallback if no time is parseable.",
+            },
+            {
+                "id": "dummy_epg_event_duration_hours",
+                "label": "⏱️ Event Duration (hours)",
+                "type": "number",
+                "default": int(self.DEFAULT_EVENT_DURATION_HOURS),
+                "help_text": "How long each scheduled event should appear in the guide (hours). Before this window the guide shows 'Upcoming at <time>: <event>'; after, 'Ended at <time>: <event>'.",
+            },
+            {
+                "id": "dummy_epg_event_timezone",
+                "label": "📺 Channel Name Event Timezone",
+                "type": "select",
+                "default": self.DEFAULT_DUMMY_EPG_TIMEZONE,
+                "help_text": "Timezone encoded in the event times inside channel names (e.g., US/Eastern for channels like '(4.17 8:30 PM ET)'). Different from the scheduler timezone above.",
+                "options": self._load_timezones_from_file()
+            },
+            {
+                "id": "_section_scheduling",
+                "label": "⏰ Scheduling & Export",
+                "type": "info",
+                "description": "Scheduled runs and CSV export options."
+            },
+            {
+                "id": "scheduled_times",
+                "label": "⏰ Scheduled Run Times (24-hour format)",
+                "type": "text",
+                "default": "",
+                "placeholder": "0600,1300,1800",
+                "help_text": "Comma-separated times to run automatically each day (24-hour format). Example: 0600,1300,1800 runs at 6 AM, 1 PM, and 6 PM daily. Leave blank to disable scheduling.",
+            },
             {
                 "id": "enable_scheduled_csv_export",
                 "label": "📄 Enable Scheduled CSV Export",
@@ -394,58 +488,41 @@ class Plugin:
                 "default": self.DEFAULT_SCHEDULED_CSV_EXPORT,
                 "help_text": "If enabled, a CSV file of the scan results will be created when the plugin runs on a schedule. If disabled, no CSV will be created for scheduled runs.",
             },
+            {
+                "id": "_section_advanced",
+                "label": "⚙️ Advanced",
+                "type": "info",
+                "description": "Performance and pacing controls for large channel profiles."
+            },
+            {
+                "id": "rate_limiting",
+                "label": "🐢 Rate Limiting",
+                "type": "select",
+                "default": self.DEFAULT_RATE_LIMITING,
+                "help_text": "Pause between per-channel ORM operations. 'none' is fastest; 'low/medium/high' add 0.05/0.2/0.5 seconds per channel. Useful when scanning very large profiles (thousands of channels) on a small DB.",
+                "options": [
+                    {"label": "None (fastest)", "value": "none"},
+                    {"label": "Low (~0.05s / channel)", "value": "low"},
+                    {"label": "Medium (~0.2s / channel)", "value": "medium"},
+                    {"label": "High (~0.5s / channel)", "value": "high"}
+                ]
+            },
         ]
 
         return fields_list
     
     # Actions for Dispatcharr UI
+    # Actions metadata mirrors plugin.json (which drives the Dispatcharr UI).
+    # Kept here so code that introspects Plugin.actions sees the same shape.
     actions = [
-        {
-            "id": "validate_configuration",
-            "label": "✅ Validate Configuration",
-            "description": "Test and validate all plugin settings (regex patterns, rules, DB connectivity)",
-            "confirm": { "required": False }
-        },
-        {
-            "id": "update_schedule",
-            "label": "💾 Update Schedule",
-            "description": "Save settings and update the scheduled run times. Use this after changing any settings.",
-        },
-        {
-            "id": "dry_run",
-            "label": "🧪 Dry Run (Export to CSV)",
-            "description": "Preview which channels would be hidden/shown without making changes. Results exported to CSV.",
-        },
-        {
-            "id": "run_now",
-            "label": "🚀 Run Now",
-            "description": "Immediately scan and update channel visibility based on current EPG data",
-            "confirm": { "required": True, "title": "Run Channel Visibility Update?", "message": "This will hide channels without events and show channels with events. Continue?" }
-        },
-        {
-            "id": "remove_epg_from_hidden",
-            "label": "🗑️ Remove EPG from Hidden Channels",
-            "description": "Remove all EPG data from channels that are disabled/hidden in the selected profile. Results exported to CSV.",
-            "confirm": { "required": True, "title": "Remove EPG Data?", "message": "This will permanently delete all EPG data for channels that are currently hidden/disabled in the selected profile. This action cannot be undone. Continue?" }
-        },
-        {
-            "id": "clear_csv_exports",
-            "label": "✨ Clear CSV Exports",
-            "description": "Delete all CSV export files created by this plugin",
-            "confirm": { "required": True, "title": "Delete All CSV Exports?", "message": "This will permanently delete all CSV files created by Event Channel Managarr. This action cannot be undone. Continue?" }
-        },
-        {
-            "id": "cleanup_periodic_tasks",
-            "label": "🧹 Cleanup Orphaned Tasks",
-            "description": "Remove any orphaned Celery periodic tasks from old plugin versions",
-            "confirm": { "required": True, "title": "Cleanup Orphaned Tasks?", "message": "This will remove any old Celery Beat tasks created by previous versions of this plugin. Continue?" }
-        },
-        {
-            "id": "check_scheduler_status",
-            "label": "🔍 Check Scheduler Status",
-            "description": "Display scheduler thread status and diagnostic information",
-            "confirm": { "required": False }
-        },
+        {"id": "validate_configuration", "label": "Validate Configuration", "description": "Test and validate all plugin settings", "button_label": "🔎 Validate", "button_variant": "outline", "button_color": "blue"},
+        {"id": "update_schedule", "label": "Update Schedule", "description": "Save settings and update the scheduled run times", "button_label": "💾 Save Schedule", "button_variant": "filled", "button_color": "green"},
+        {"id": "dry_run", "label": "Dry Run (Export to CSV)", "description": "Preview which channels would be hidden/shown without making changes", "button_label": "👁️ Dry Run", "button_variant": "outline", "button_color": "cyan"},
+        {"id": "run_now", "label": "Run Now", "description": "Immediately scan and update channel visibility based on current EPG data", "button_label": "▶️ Run Now", "button_variant": "filled", "button_color": "green", "confirm": {"message": "This will apply visibility changes and (if enabled) attach/detach managed EPG. Continue?"}},
+        {"id": "remove_epg_from_hidden", "label": "Remove EPG from Hidden Channels", "description": "Remove all EPG data from channels that are disabled/hidden in the selected profile", "button_label": "🧹 Remove EPG from Hidden", "button_variant": "filled", "button_color": "red", "confirm": {"message": "This will CLEAR EPG data from every hidden channel in the selected profile. Cannot be undone by this plugin. Continue?"}},
+        {"id": "clear_csv_exports", "label": "Clear CSV Exports", "description": "Delete all CSV export files created by this plugin", "button_label": "🗑️ Clear CSV Exports", "button_variant": "filled", "button_color": "red", "confirm": {"message": "This will delete every CSV file in /data/exports created by this plugin. Continue?"}},
+        {"id": "cleanup_periodic_tasks", "label": "Cleanup Orphaned Tasks", "description": "Remove any orphaned Celery periodic tasks from old plugin versions", "button_label": "🧼 Cleanup Orphaned Tasks", "button_variant": "outline", "button_color": "orange", "confirm": {"message": "This removes orphaned Celery periodic tasks left by older plugin versions. Continue?"}},
+        {"id": "check_scheduler_status", "label": "Check Scheduler Status", "description": "Display scheduler thread status and diagnostic information", "button_label": "🩺 Check Scheduler", "button_variant": "outline", "button_color": "blue"},
     ]
     
     def __init__(self):
@@ -865,7 +942,15 @@ class Plugin:
                 settings["keep_duplicates"] = self.DEFAULT_KEEP_DUPLICATES
             if "auto_set_dummy_epg_on_hide" not in settings:
                 settings["auto_set_dummy_epg_on_hide"] = self.DEFAULT_AUTO_REMOVE_EPG
-            
+            if "manage_dummy_epg" not in settings:
+                settings["manage_dummy_epg"] = self.DEFAULT_MANAGE_DUMMY_EPG
+            if "dummy_epg_event_duration_hours" not in settings:
+                settings["dummy_epg_event_duration_hours"] = self.DEFAULT_EVENT_DURATION_HOURS
+            if "dummy_epg_event_timezone" not in settings:
+                settings["dummy_epg_event_timezone"] = self.DEFAULT_DUMMY_EPG_TIMEZONE
+            if "rate_limiting" not in settings:
+                settings["rate_limiting"] = self.DEFAULT_RATE_LIMITING
+
             with open(self.settings_file, 'w') as f:
                 json.dump(settings, f, indent=2)
             self.saved_settings = settings
@@ -873,6 +958,44 @@ class Plugin:
             LOGGER.info(f"  Final value of enable_scheduled_csv_export: {settings.get('enable_scheduled_csv_export')}")
         except Exception as e:
             LOGGER.error(f"Error saving settings: {e}")
+
+    def _load_undated_tracker(self, logger):
+        """Load the undated-channel first-seen tracker from disk."""
+        path = PluginConfig.UNDATED_FIRST_SEEN_FILE
+        try:
+            with open(path, 'r') as f:
+                data = json.load(f)
+            if not isinstance(data, dict):
+                logger.warning(f"{LOG_PREFIX} Undated tracker at {path} is not a dict; starting fresh.")
+                return {}
+            return data
+        except FileNotFoundError:
+            return {}
+        except (json.JSONDecodeError, OSError) as e:
+            logger.warning(f"{LOG_PREFIX} Could not load undated tracker ({e}); starting fresh.")
+            return {}
+
+    def _save_undated_tracker(self, tracker, logger):
+        """Atomically save the undated-channel first-seen tracker to disk. Returns True on success."""
+        path = PluginConfig.UNDATED_FIRST_SEEN_FILE
+        tmp_path = f"{path}.tmp"
+        try:
+            with open(tmp_path, 'w') as f:
+                json.dump(tracker, f, indent=2, sort_keys=True)
+            os.replace(tmp_path, path)
+            return True
+        except OSError as e:
+            logger.error(f"{LOG_PREFIX} Failed to save undated tracker: {e}")
+            return False
+
+    def _record_undated_channel(self, tracker, channel_id, channel_name, today_str):
+        """Record/refresh a channel in the undated tracker. Returns the entry."""
+        key = str(channel_id)
+        entry = tracker.get(key)
+        if not entry or entry.get("name") != channel_name:
+            entry = {"first_seen": today_str, "name": channel_name}
+            tracker[key] = entry
+        return entry
 
     def _parse_hide_rules(self, rules_text, logger):
         """Parse hide rules priority text into list of rule tuples"""
@@ -1179,8 +1302,11 @@ class Plugin:
             return False, None
         
         elif rule_name == "EmptyPlaceholder":
-            # Ends with colon, pipe, or dash with nothing or only whitespace/very short content after
-            colon_match = re.search(r':(.*)$', channel_name)
+            # Ends with colon, pipe, or dash with nothing or only whitespace/very short content after.
+            # The `(?=\s|$)` lookahead after the colon excludes time-colons like "7:00AM" / "9:45am"
+            # (colon followed by a digit) while still matching real separator colons like
+            # "PPV 12: Title" or trailing-empty-colon "PPV 25:".
+            colon_match = re.search(r':(?=\s|$)(.*)$', channel_name)
             if colon_match:
                 content_after = colon_match.group(1).strip()
                 if not content_after or len(content_after) <= 2:
@@ -1203,8 +1329,10 @@ class Plugin:
             return False, None
         
         elif rule_name == "ShortDescription":
-            # Check description length after separators (colon, pipe, or dash)
-            colon_match = re.search(r':(.+)$', channel_name)
+            # Check description length after separators (colon, pipe, or dash).
+            # The `(?=\s)` lookahead after the colon excludes time-colons like "7:00AM"
+            # so only real separator colons like "PPV 12: Title" are measured.
+            colon_match = re.search(r':(?=\s)(.+)$', channel_name)
             if colon_match:
                 description = colon_match.group(1).strip()
                 if len(description) < 15:
@@ -1231,7 +1359,12 @@ class Plugin:
             # Normalize whitespace first to handle multiple spaces, tabs, etc.
             normalized_name = re.sub(r'\s+', ' ', channel_name.strip())
 
-            colon_match = re.search(r':(.+)$', normalized_name)
+            # `(?=\s)` excludes time-colons (7:00, 9:45) so a channel like "LIVE 10:30"
+            # is correctly seen as having NO real separator. Also requires content after
+            # the colon so trailing-empty colons ("PPV 25:") still count as "no separator"
+            # here — matching pre-fix behavior. [EmptyPlaceholder] catches those cases
+            # earlier in the rule chain.
+            colon_match = re.search(r':(?=\s)(.+)$', normalized_name)
             pipe_match = re.search(r'\|(.+)$', normalized_name)
             dash_match = re.search(r'\s-\s', normalized_name)  # Dash with surrounding spaces
 
@@ -1312,6 +1445,39 @@ class Plugin:
             
             return False, None
         
+        elif rule_name == "UndatedAge":
+            tracker = getattr(self, '_undated_tracker', None) or {}
+            entry = tracker.get(str(channel.id))
+            if not entry:
+                return False, None
+            try:
+                first_seen = datetime.strptime(entry['first_seen'], '%Y-%m-%d').date()
+            except (KeyError, ValueError, TypeError):
+                return False, None
+
+            # Accept [UndatedAge:N] or, defensively, [UndatedAge:N:Xh] (grace hours ignored —
+            # undated age is day-granular).
+            if isinstance(rule_param, tuple):
+                threshold = rule_param[0]
+            else:
+                threshold = rule_param if rule_param is not None else 2
+
+            today_str = getattr(self, '_undated_today_str', None)
+            if today_str:
+                today = datetime.strptime(today_str, '%Y-%m-%d').date()
+            else:
+                tz_str = self._get_system_timezone(settings)
+                try:
+                    local_tz = pytz.timezone(tz_str)
+                except pytz.exceptions.UnknownTimeZoneError:
+                    local_tz = pytz.timezone(self.DEFAULT_TIMEZONE)
+                today = datetime.now(local_tz).date()
+
+            age_days = (today - first_seen).days
+            if age_days > threshold:
+                return True, f"[UndatedAge:{threshold}] No date in name; first seen {first_seen.isoformat()} ({age_days} days ago, threshold: {threshold})"
+            return False, None
+
         elif rule_name == "InactiveRegex":
             regex_inactive_str = settings.get("regex_mark_inactive", "").strip()
             logger.debug(f"[InactiveRegex] Checking pattern '{regex_inactive_str}' against channel name '{channel_name}'")
@@ -1476,46 +1642,86 @@ class Plugin:
             return {"status": "error", "message": f"Error clearing CSV exports: {e}"}
 
     def check_scheduler_status_action(self, settings, logger):
-        """Display scheduler thread status and diagnostic information"""
+        """Display scheduler status and diagnostic information.
+
+        NOTE ON SCOPE: Dispatcharr runs under uwsgi with multiple worker processes,
+        and each worker loads the plugin independently and starts its own scheduler
+        thread. `threading.enumerate()` only sees threads in the single worker that
+        handled this HTTP request, so the "Threads in this worker" count below is
+        per-worker, not container-wide. Coordination across workers is via the
+        shared files /data/event_channel_managarr_last_run.json (pre-run check)
+        and /data/event_channel_managarr_scan.lock (flock during scan) — those
+        guarantee each scheduled time fires exactly once no matter how many
+        worker threads exist.
+        """
         global _bg_thread
         try:
-            # Count all threads with our scheduler name
-            all_threads = threading.enumerate()
-            scheduler_threads = [t for t in all_threads if "event-channel-managarr-scheduler" in t.name]
-
-            status_lines = []
-
-            # Main scheduler thread status
-            if _bg_thread and _bg_thread.is_alive():
-                status_lines.append("✅ Scheduler: Running")
+            # --- This worker's scheduler thread ---
+            worker_pid = os.getpid()
+            scheduler_threads = [t for t in threading.enumerate() if "event-channel-managarr-scheduler" in t.name]
+            running = bool(_bg_thread and _bg_thread.is_alive())
+            n = len(scheduler_threads)
+            if n > 1:
+                thread_state = f"⚠️ {n} threads in one worker (leak)"
+            elif running:
+                thread_state = "running"
             else:
-                status_lines.append("❌ Scheduler: Not running")
+                thread_state = "not running"
 
-            # Check for multiple scheduler threads (this would be a bug)
-            if len(scheduler_threads) > 1:
-                status_lines.append(f"⚠️  WARNING: {len(scheduler_threads)} threads detected! May cause duplicates.")
-
-            # Configured scheduled times
+            # --- Configured schedule + next run ---
+            schedule_line = "Schedule: none configured"
             scheduled_times_str = settings.get("scheduled_times", "").strip()
             if scheduled_times_str:
                 times = self._parse_scheduled_times(scheduled_times_str)
                 if times:
                     tz_str = self._get_system_timezone(settings)
-                    status_lines.append(f"⏰ Times: {', '.join([t.strftime('%H:%M') for t in times])} ({tz_str})")
+                    try:
+                        local_tz = pytz.timezone(tz_str)
+                    except pytz.exceptions.UnknownTimeZoneError:
+                        local_tz = pytz.timezone(self.DEFAULT_TIMEZONE)
+                    now = datetime.now(local_tz)
+                    upcoming = []
+                    for t in times:
+                        today_dt = local_tz.localize(datetime.combine(now.date(), t))
+                        tomorrow_dt = local_tz.localize(datetime.combine(now.date() + timedelta(days=1), t))
+                        upcoming.append(today_dt if today_dt > now else tomorrow_dt)
+                    next_run = min(upcoming)
+                    delta = next_run - now
+                    hours, rem = divmod(int(delta.total_seconds()), 3600)
+                    minutes = rem // 60
+                    times_fmt = ",".join(t.strftime("%H:%M") for t in times)
+                    schedule_line = f"Schedule: {times_fmt} {tz_str} | next {next_run.strftime('%H:%M')} in {hours}h{minutes:02d}m"
                 else:
-                    status_lines.append("⚠️  Invalid times")
-            else:
-                status_lines.append("⏰ No times configured")
+                    schedule_line = "Schedule: ⚠️ invalid times"
 
-            # Last run tracking (read from shared file across all workers)
+            # --- Last runs (shared file, container-wide) ---
             last_run_data = _read_last_run()
-            if last_run_data:
-                last_runs = [f"{time_str} on {date_str}" for time_str, date_str in last_run_data.items()]
-                status_lines.append(f"📅 Last runs: {', '.join(last_runs)}")
+            last_runs_line = (
+                "Last runs: " + ", ".join(f"{k}={v}" for k, v in sorted(last_run_data.items()))
+                if last_run_data else "Last runs: none yet"
+            )
+
+            # --- Scan lock probe ---
+            scan_lock_path = PluginConfig.SCAN_LOCK_FILE
+            if os.path.exists(scan_lock_path) and fcntl:
+                try:
+                    with open(scan_lock_path, 'r') as probe:
+                        fcntl.flock(probe, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                        fcntl.flock(probe, fcntl.LOCK_UN)
+                    lock_str = "free"
+                except (OSError, IOError):
+                    lock_str = "HELD"
+            else:
+                lock_str = "none"
 
             return {
                 "status": "success",
-                "message": "\n".join(status_lines)
+                "message": (
+                    f"Scheduler [PID {worker_pid}]: {thread_state} | lock: {lock_str}\n"
+                    f"{schedule_line}\n"
+                    f"{last_runs_line}\n"
+                    f"(per-worker view; coordination via shared files)"
+                )
             }
 
         except Exception as e:
@@ -1640,25 +1846,10 @@ class Plugin:
                             already_ran = last_run_data.get(time_key) == str(current_date)
 
                             if -30 <= time_diff <= 30 and not already_ran:
-                                # Acquire cross-process file lock to prevent concurrent scans
-                                lock_fd = None
-                                if fcntl:
-                                    try:
-                                        lock_fd = open(_SCAN_LOCK_FILE, 'w')
-                                        fcntl.flock(lock_fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
-                                    except (OSError, IOError):
-                                        LOGGER.info(f"[{thread_id}] Another worker is already running the scheduled scan, skipping")
-                                        if lock_fd:
-                                            lock_fd.close()
-                                        break
-
+                                # Cross-process concurrency is enforced inside _scan_and_update_channels
+                                # (flock on SCAN_LOCK_FILE). This covers manual Run Now / Dry Run too,
+                                # which the old scheduler-only flock did not.
                                 try:
-                                    # Re-check after acquiring lock (another worker may have just finished)
-                                    last_run_data = _read_last_run()
-                                    if last_run_data.get(time_key) == str(current_date):
-                                        LOGGER.info(f"[{thread_id}] Scan already completed by another worker, skipping")
-                                        break
-
                                     LOGGER.info(f"[{thread_id}] Scheduled scan triggered at {now.strftime('%Y-%m-%d %H:%M %Z')}")
 
                                     # Reload settings from disk to get the latest configuration
@@ -1688,6 +1879,13 @@ class Plugin:
                                         results_data = result.get("results", {})
                                         if results_data.get("to_hide", 0) > 0 or results_data.get("to_show", 0) > 0:
                                             self._trigger_frontend_refresh(current_settings, LOGGER)
+
+                                    # If _scan_and_update_channels skipped because another worker
+                                    # was scanning, don't mark this slot as executed — let that worker
+                                    # (or the next scheduler tick) do it.
+                                    if result.get("skipped_due_to_lock"):
+                                        LOGGER.info(f"[{thread_id}] Skipped due to active scan in another worker; not marking {time_key} as executed")
+                                        break
                                 except Exception as e:
                                     LOGGER.error(f"[{thread_id}] Error in scheduled scan: {e}")
 
@@ -1703,15 +1901,6 @@ class Plugin:
                                     last_run_data[time_key] = str(current_date)
                                     _write_last_run(last_run_data)
                                     LOGGER.info(f"[{thread_id}] Marked {time_key} as executed for {current_date}")
-                                finally:
-                                    # Always release the file lock
-                                    if lock_fd:
-                                        try:
-                                            if fcntl:
-                                                fcntl.flock(lock_fd, fcntl.LOCK_UN)
-                                            lock_fd.close()
-                                        except OSError:
-                                            pass
 
                                 break
 
@@ -1889,6 +2078,224 @@ class Plugin:
         
         return duplicate_hide_list
 
+    def _get_or_create_managed_epg_source(self, settings, logger):
+        """Create (if missing) or refresh the shared plugin-managed dummy EPGSource.
+
+        Returns the EPGSource, or None on error.
+        """
+        from apps.epg.models import EPGSource
+
+        # Parse duration with fallback
+        try:
+            duration_hours = int(str(settings.get("dummy_epg_event_duration_hours",
+                                                   self.DEFAULT_EVENT_DURATION_HOURS)).strip())
+        except (ValueError, TypeError):
+            logger.warning(f"{LOG_PREFIX} Invalid dummy_epg_event_duration_hours; using default")
+            duration_hours = int(self.DEFAULT_EVENT_DURATION_HOURS)
+        if duration_hours <= 0:
+            duration_hours = int(self.DEFAULT_EVENT_DURATION_HOURS)
+
+        tz_value = str(settings.get("dummy_epg_event_timezone",
+                                    self.DEFAULT_DUMMY_EPG_TIMEZONE)).strip() or self.DEFAULT_DUMMY_EPG_TIMEZONE
+
+        # Keys the plugin owns. Any other keys on the source are left untouched.
+        # Regexes validated against these four real channel names:
+        #   "PPV EVENT 12: Cage Fury FC 153 (4.17 8:30 PM ET)"  -> title="Cage Fury FC 153"
+        #   "LIVE EVENT 01   9:45am Suslenkov v Mann"           -> title="Suslenkov v Mann"
+        #   "PPV EVENT 25: OUTDOOR THEATRE Live From Coachella" -> title="OUTDOOR THEATRE Live From Coachella"
+        #   "PPV02 | UFC 327: English Apr 14 4:30 PM"           -> title="UFC 327: English"
+        # The title capture stops at the first of: " (", a time token, or a month-name token.
+        # leading_time handles names where the time appears BEFORE the event text (LIVE format).
+        managed_props = {
+            "title_pattern": (
+                r"(?:PPV|LIVE)\s*(?:EVENT\s*)?\d+\s*[:|\s]\s*"
+                r"(?:(?P<leading_time>\d{1,2}(?::\d{2})?\s*[AaPp][Mm])\s+)?"
+                r"(?P<title>.+?)"
+                r"(?=\s*\(|\s+\d{1,2}(?::\d{2})?\s*[AaPp][Mm]|"
+                r"\s+(?:Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)\s+\d+|$)"
+            ),
+            "time_pattern": r"(?P<hour>\d{1,2})(?::(?P<minute>\d{2}))?\s*(?P<ampm>[AaPp][Mm])",
+            "date_pattern": r"\b(?P<month>\d{1,2})[./](?P<day>\d{1,2})(?:[./](?P<year>\d{2,4}))?\b",
+            "title_template": "{title}",
+            # Informative pre/post-event titles using Dispatcharr's
+            # auto-computed {starttime}/{endtime} placeholders plus the
+            # extracted {title}. Examples at render time:
+            #   Upcoming at 8:00 PM: Cage Fury FC 153
+            #   Ended at 11:00 PM: Cage Fury FC 153
+            "upcoming_title_template": "Upcoming at {starttime}: {title}",
+            "ended_title_template": "Ended at {endtime}: {title}",
+            "fallback_title_template": "{channel_name}",
+            "program_duration": duration_hours * 60,
+            "timezone": tz_value,
+            "include_date": False,
+            "managed_by": "event-channel-managarr",
+        }
+
+        try:
+            source, created = EPGSource.objects.get_or_create(
+                name="ECM Managed Dummy",
+                defaults={
+                    "source_type": "dummy",
+                    "is_active": True,
+                    "custom_properties": managed_props,
+                },
+            )
+        except Exception as e:
+            logger.error(f"{LOG_PREFIX} Failed to get_or_create managed EPGSource: {e}")
+            return None
+
+        if created:
+            logger.info(f"{LOG_PREFIX} Created managed EPGSource 'ECM Managed Dummy' (id={source.id})")
+            return source
+
+        # Existing source: refresh only the plugin-managed keys, preserving any
+        # user-added keys.
+        current = dict(source.custom_properties or {})
+        changed = False
+        for k, v in managed_props.items():
+            if current.get(k) != v:
+                current[k] = v
+                changed = True
+        if source.source_type != "dummy":
+            logger.warning(f"{LOG_PREFIX} 'ECM Managed Dummy' exists but source_type={source.source_type!r}; leaving alone")
+            return None
+        if changed:
+            source.custom_properties = current
+            try:
+                source.save(update_fields=["custom_properties"])
+                logger.info(f"{LOG_PREFIX} Refreshed managed EPGSource custom_properties (id={source.id})")
+            except Exception as e:
+                logger.error(f"{LOG_PREFIX} Failed to update managed EPGSource: {e}")
+                return None
+        return source
+
+    def _attach_managed_epg(self, channels, managed_source, logger, rate_limiter=None):
+        """Bind each channel in `channels` to the managed dummy source via an EPGData row.
+
+        Only touches channels where epg_data IS NULL. Returns list of channel IDs that
+        were attached (for result reporting).
+        """
+        from apps.epg.models import EPGData
+
+        attached_ids = []
+        channels_to_update = []
+
+        # Wrap the entire get_or_create + bulk_update cycle in one transaction so a
+        # bulk_update failure doesn't leave orphan EPGData rows pointing nowhere.
+        with transaction.atomic():
+            for channel in channels:
+                if channel.epg_data_id is not None:
+                    continue
+                try:
+                    epg_data, _ = EPGData.objects.get_or_create(
+                        tvg_id=str(channel.uuid),
+                        epg_source=managed_source,
+                        defaults={"name": channel.name},
+                    )
+                    # Keep EPGData.name in sync with the channel name so {channel_name}
+                    # in the dummy source's fallback template renders correctly.
+                    if epg_data.name != channel.name:
+                        epg_data.name = channel.name
+                        epg_data.save(update_fields=["name"])
+                except Exception as e:
+                    logger.warning(f"{LOG_PREFIX} Failed to get_or_create EPGData for channel {channel.id}: {e}")
+                    continue
+
+                channel.epg_data = epg_data
+                channels_to_update.append(channel)
+                attached_ids.append(channel.id)
+
+                if rate_limiter is not None:
+                    rate_limiter.wait()
+
+            if channels_to_update:
+                Channel.objects.bulk_update(channels_to_update, ["epg_data"])
+                logger.info(f"{LOG_PREFIX} Attached managed EPG to {len(channels_to_update)} channel(s)")
+        return attached_ids
+
+    def _detach_managed_epg(self, managed_source, keep_channel_ids, logger):
+        """Set epg_data=None on any channel currently bound to the managed source
+        whose id is NOT in keep_channel_ids. Returns list of detached channel IDs.
+        """
+        if managed_source is None:
+            return []
+
+        stale = list(Channel.objects.filter(
+            epg_data__epg_source=managed_source
+        ).exclude(id__in=keep_channel_ids))
+
+        if not stale:
+            return []
+
+        for ch in stale:
+            ch.epg_data = None
+
+        with transaction.atomic():
+            Channel.objects.bulk_update(stale, ["epg_data"])
+
+        detached_ids = [ch.id for ch in stale]
+        logger.info(f"{LOG_PREFIX} Detached managed EPG from {len(detached_ids)} channel(s)")
+        return detached_ids
+
+    def _run_managed_epg_pass(self, settings, logger, dry_run, enabled_channel_ids):
+        """Attach/detach the plugin's managed dummy EPG based on current settings.
+
+        If the master toggle is off, still runs the detach cleanup so turning the
+        feature off reliably un-assigns managed EPG. Returns (attached_ids, detached_ids).
+
+        Dry-run is a pure preview: it NEVER creates the EPGSource row and NEVER writes
+        attach/detach changes. It only reports what an applied run would do.
+        """
+        from apps.epg.models import EPGSource
+
+        toggle_on = self._get_bool_setting(settings, "manage_dummy_epg", False)
+
+        if dry_run:
+            # Pure preview — locate existing source only; do not create.
+            managed_source = EPGSource.objects.filter(
+                name="ECM Managed Dummy", source_type="dummy"
+            ).first()
+            if managed_source is None:
+                return [], []
+            if toggle_on:
+                attached_ids = list(Channel.objects.filter(
+                    id__in=enabled_channel_ids, epg_data__isnull=True
+                ).values_list("id", flat=True))
+                detached_ids = list(Channel.objects.filter(
+                    epg_data__epg_source=managed_source
+                ).exclude(id__in=enabled_channel_ids).values_list("id", flat=True))
+            else:
+                attached_ids = []
+                detached_ids = list(Channel.objects.filter(
+                    epg_data__epg_source=managed_source
+                ).values_list("id", flat=True))
+            logger.info(f"{LOG_PREFIX} [dry-run] Managed EPG would attach {len(attached_ids)}, detach {len(detached_ids)}")
+            return attached_ids, detached_ids
+
+        # Applied run — may create/refresh the source row.
+        if toggle_on:
+            managed_source = self._get_or_create_managed_epg_source(settings, logger)
+        else:
+            managed_source = EPGSource.objects.filter(
+                name="ECM Managed Dummy", source_type="dummy"
+            ).first()
+
+        if managed_source is None:
+            return [], []
+
+        attached_ids = []
+        if toggle_on:
+            no_epg_channels = list(Channel.objects.filter(
+                id__in=enabled_channel_ids, epg_data__isnull=True
+            ))
+            rate_limiter = SmartRateLimiter(settings.get("rate_limiting", self.DEFAULT_RATE_LIMITING))
+            attached_ids = self._attach_managed_epg(no_epg_channels, managed_source, logger, rate_limiter=rate_limiter)
+
+        keep_ids = set(enabled_channel_ids) if toggle_on else set()
+        detached_ids = self._detach_managed_epg(managed_source, keep_ids, logger)
+
+        return attached_ids, detached_ids
+
     def _get_channel_visibility(self, channel_id, profile_ids, logger):
         """Get current visibility status for a channel in profiles - returns True if enabled in ANY profile"""
         try:
@@ -1906,6 +2313,24 @@ class Plugin:
 
     def _scan_and_update_channels(self, settings, logger, dry_run=True, is_scheduled_run=False):
         """Scan channels and update visibility based on hide rules priority"""
+        # Cross-worker serialization: one scan at a time across all uwsgi workers.
+        # Covers manual Run Now / Dry Run as well as scheduled runs.
+        lock_fd = None
+        if fcntl:
+            try:
+                lock_fd = open(PluginConfig.SCAN_LOCK_FILE, 'w')
+                fcntl.flock(lock_fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            except (OSError, IOError):
+                if lock_fd:
+                    lock_fd.close()
+                lock_fd = None
+                msg = "Another scan is already running in this or another worker. Skipping."
+                if is_scheduled_run:
+                    logger.info(f"{LOG_PREFIX} {msg}")
+                    return {"status": "success", "message": msg, "skipped_due_to_lock": True}
+                logger.warning(f"{LOG_PREFIX} {msg}")
+                return {"status": "error", "message": msg, "skipped_due_to_lock": True}
+
         try:
             # Validate required settings
             channel_profile_names_str = settings.get("channel_profile_name", "").strip()
@@ -2001,15 +2426,35 @@ class Plugin:
             # Initialize progress tracker
             progress = ProgressTracker(total_channels, "Channel Scan", logger)
 
+            # Load undated-channel first-seen tracker (used by [UndatedAge:N] rule)
+            self._undated_tracker = self._load_undated_tracker(logger)
+            tracker_before = len(self._undated_tracker)
+            tz_str = self._get_system_timezone(settings)
+            try:
+                local_tz = pytz.timezone(tz_str)
+            except pytz.exceptions.UnknownTimeZoneError:
+                local_tz = pytz.timezone(self.DEFAULT_TIMEZONE)
+            # Capture once per scan so records and rule evaluations agree even if
+            # the scan crosses local midnight.
+            self._undated_today_str = datetime.now(local_tz).date().isoformat()
+            today_str = self._undated_today_str
+            tracked_this_scan = set()
+
             results = []
             channels_to_hide = []
             channels_to_show = []
             channels_ignored = []
             channels_for_duplicate_check = []
-            
+
             # Track channel info for enhanced logging
             channel_info_map = {}
-            
+
+            # Optional pacing for large profiles. Reads from settings each scan so
+            # toggling the UI select takes effect on the next run.
+            rate_limiter = SmartRateLimiter(settings.get("rate_limiting", self.DEFAULT_RATE_LIMITING))
+            if rate_limiter.is_active():
+                logger.info(f"{LOG_PREFIX} Rate limiting active: {rate_limiter.level} ({rate_limiter.delay}s/channel)")
+
             # Process each channel
             for i, channel in enumerate(channels):
                 if self._op_stop_event.is_set():
@@ -2026,6 +2471,9 @@ class Plugin:
                 # Check if channel should be ignored
                 if regex_ignore and regex_ignore.search(channel_name):
                     channels_ignored.append(channel.id)
+                    # Preserve any existing undated-tracker entry for this channel so first_seen
+                    # doesn't reset if the user later removes the ignore regex.
+                    tracked_this_scan.add(str(channel.id))
                     results.append({
                         "channel_id": channel.id,
                         "channel_name": channel_name,
@@ -2035,15 +2483,20 @@ class Plugin:
                         "action": "Ignored",
                         "reason": "Matches ignore regex",
                         "hide_rule": "",
-                        "has_epg": "Yes" if channel.epg_data else "No"
+                        "has_epg": "Yes" if channel.epg_data else "No",
+                        "managed_epg_assigned": False,
+                        "managed_epg_detached": False,
                     })
+                    rate_limiter.wait()
                     continue
 
                 # Check if channel should be forced visible
                 if regex_force_visible and regex_force_visible.search(channel_name):
                     if not current_visible:
                         channels_to_show.append(channel.id)
-                    
+
+                    # Preserve any existing undated-tracker entry — same reason as above.
+                    tracked_this_scan.add(str(channel.id))
                     results.append({
                         "channel_id": channel.id,
                         "channel_name": channel_name,
@@ -2053,10 +2506,21 @@ class Plugin:
                         "action": "Forced Visible" if not current_visible else "Visible (Forced)",
                         "reason": "Matches force visible regex",
                         "hide_rule": "[ForceVisible]",
-                        "has_epg": "Yes" if channel.epg_data else "No"
+                        "has_epg": "Yes" if channel.epg_data else "No",
+                        "managed_epg_assigned": False,
+                        "managed_epg_detached": False,
                     })
+                    rate_limiter.wait()
                     continue
-                
+
+                # Update undated-channel tracker: record channels with no extractable date,
+                # drop those that now have a date.
+                if self._extract_date_from_channel_name(channel_name, logger) is None:
+                    self._record_undated_channel(self._undated_tracker, channel.id, channel_name, today_str)
+                    tracked_this_scan.add(str(channel.id))
+                else:
+                    self._undated_tracker.pop(str(channel.id), None)
+
                 # Check hide rules
                 should_hide, reason = self._check_channel_should_hide(channel, hide_rules, logger, settings)
                 
@@ -2092,7 +2556,19 @@ class Plugin:
                     channels_to_hide.append(channel.id)
                 elif action_needed == "show":
                     channels_to_show.append(channel.id)
-            
+
+                rate_limiter.wait()
+
+            # Prune undated tracker: drop entries for channels not evaluated this scan
+            # (deleted or now dated). Ignored/force-visible channels are preserved if they
+            # already have entries — see the per-channel loop above.
+            pruned = [k for k in self._undated_tracker if k not in tracked_this_scan]
+            for k in pruned:
+                self._undated_tracker.pop(k, None)
+            saved = self._save_undated_tracker(self._undated_tracker, logger)
+            save_status = "saved" if saved else "save FAILED (see errors above)"
+            logger.info(f"{LOG_PREFIX} Undated tracker: {tracker_before} loaded, {len(tracked_this_scan)} tracked, {len(pruned)} pruned, {len(self._undated_tracker)} {save_status}")
+
             # Handle duplicates - only process channels that would be visible
             logger.info("Checking for duplicate channels...")
             # Filter to only channels that would be visible (either currently visible or about to be shown)
@@ -2110,7 +2586,39 @@ class Plugin:
                 strategy=settings.get("duplicate_strategy", "lowest_number"),
                 keep_duplicates=self._get_bool_setting(settings, "keep_duplicates", False)
             )
-            
+
+            # Managed Dummy EPG pass — runs before results are built so per-channel
+            # result dicts can report managed_epg_assigned / managed_epg_detached.
+            # Compute the "enabled after this scan" set from in-memory decisions so
+            # dry-run and applied-run paths produce identical attach/detach counts.
+            managed_attached_set = set()
+            managed_detached_set = set()
+            enabled_channel_ids = [
+                ch["channel_id"] for ch in channels_for_duplicate_check
+                if (
+                    (ch["current_visible"] and ch["channel_id"] not in channels_to_hide)
+                    or ch["channel_id"] in channels_to_show
+                ) and ch["channel_id"] not in duplicate_hide_list
+            ]
+            managed_attached_ids, managed_detached_ids = self._run_managed_epg_pass(
+                settings, logger, dry_run, enabled_channel_ids
+            )
+            managed_attached_set = set(managed_attached_ids)
+            managed_detached_set = set(managed_detached_ids)
+
+            # Patch result rows appended by the ignored-regex / force-visible
+            # early-exit branches earlier in this method — they hardcode the
+            # managed-EPG flags to False because the pass hadn't run yet. The
+            # detach pass may have cleared their epg_data (if they were bound
+            # in a prior scan), so re-sync the report with actual set state.
+            if managed_detached_set or managed_attached_set:
+                for row in results:
+                    cid = row.get("channel_id")
+                    if cid in managed_detached_set:
+                        row["managed_epg_detached"] = True
+                    if cid in managed_attached_set:
+                        row["managed_epg_assigned"] = True
+
             # Build final results with duplicate information
             for channel_info in channels_for_duplicate_check:
                 channel_id = channel_info['channel_id']
@@ -2151,7 +2659,9 @@ class Plugin:
                     "action": final_action,
                     "reason": reason,
                     "hide_rule": hide_rule,
-                    "has_epg": channel_info['has_epg']
+                    "has_epg": channel_info['has_epg'],
+                    "managed_epg_assigned": channel_id in managed_attached_set,
+                    "managed_epg_detached": channel_id in managed_detached_set,
                 })
             
             # Mark scan as complete
@@ -2187,6 +2697,9 @@ class Plugin:
                     f"Channels to Show: {len(channels_to_show)}",
                     f"Channels Ignored: {len(channels_ignored)}",
                     f"Duplicates Hidden: {total_duplicates_hidden}",
+                    f"Managed EPG Attached: {len(managed_attached_set)}",
+                    f"Managed EPG Detached: {len(managed_detached_set)}",
+                    f"Rate Limiting: {settings.get('rate_limiting', self.DEFAULT_RATE_LIMITING)}",
                 ]
                 if rule_stats:
                     header_lines.append("Rule Effectiveness:")
@@ -2194,8 +2707,39 @@ class Plugin:
                         header_lines.append(f"  {rule}: {count} channels")
                 header_lines.append(f"Hide Rules Priority: {hide_rules_text_for_export}")
 
+                # Full settings snapshot so a CSV is self-describing. Skip legacy keys
+                # that may hold credentials (dispatcharr_username/password from pre-ORM
+                # versions) and already-exported lines (rate_limiting, hide_rules_priority).
+                settings_keys = [
+                    "timezone",
+                    "channel_profile_name",
+                    "channel_groups",
+                    "name_source",
+                    "regex_channels_to_ignore",
+                    "regex_mark_inactive",
+                    "regex_force_visible",
+                    "past_date_grace_hours",
+                    "duplicate_strategy",
+                    "keep_duplicates",
+                    "auto_set_dummy_epg_on_hide",
+                    "manage_dummy_epg",
+                    "dummy_epg_event_duration_hours",
+                    "dummy_epg_event_timezone",
+                    "scheduled_times",
+                    "enable_scheduled_csv_export",
+                ]
+                header_lines.append("Settings:")
+                for k in settings_keys:
+                    v = settings.get(k, "")
+                    if v == "" or v is None:
+                        v_str = "(empty)"
+                    else:
+                        v_str = str(v)
+                    header_lines.append(f"  {k}: {v_str}")
+
                 fieldnames = ['channel_id', 'channel_name', 'channel_number', 'channel_group',
-                            'current_visibility', 'action', 'reason', 'hide_rule', 'has_epg']
+                            'current_visibility', 'action', 'reason', 'hide_rule', 'has_epg',
+                            'managed_epg_assigned', 'managed_epg_detached']
                 csv_filepath = self._export_csv(csv_filename, results, fieldnames, logger, header_lines)
             
             # Apply changes if not dry run
@@ -2277,6 +2821,7 @@ class Plugin:
                 f"• Channels to show: {len(channels_to_show)}",
                 f"• Channels ignored: {len(channels_ignored)}",
                 f"• Duplicate channels hidden: {total_duplicates_hidden}",
+                f"• Managed EPG: {len(managed_attached_set)} attached, {len(managed_detached_set)} detached",
                 f"",
             ]
             if csv_filepath:
@@ -2308,6 +2853,8 @@ class Plugin:
                     "to_show": len(channels_to_show),
                     "ignored": len(channels_ignored),
                     "duplicates_hidden": total_duplicates_hidden,
+                    "managed_epg_attached": len(managed_attached_set),
+                    "managed_epg_detached": len(managed_detached_set),
                     "csv_file": csv_filepath if csv_filepath else "N/A"
                 }
             }
@@ -2317,9 +2864,42 @@ class Plugin:
             import traceback
             logger.error(f"Traceback: {traceback.format_exc()}")
             return {"status": "error", "message": f"Error scanning channels: {str(e)}"}
+        finally:
+            if lock_fd:
+                try:
+                    if fcntl:
+                        fcntl.flock(lock_fd, fcntl.LOCK_UN)
+                    lock_fd.close()
+                except OSError:
+                    pass
+
+    def _compact_scan_summary(self, label, result):
+        """Build a single-line toast-sized summary from a scan result dict.
+
+        The full multi-line `message` returned by `_scan_and_update_channels`
+        is kept in logs and in the CSV header; the short form below is what
+        the Dispatcharr notification window shows.
+        """
+        if not isinstance(result, dict) or result.get("status") != "success":
+            return None
+        res = result.get("results") or {}
+        total = res.get("total_channels", 0)
+        to_hide = res.get("to_hide", 0)
+        to_show = res.get("to_show", 0)
+        attached = res.get("managed_epg_attached", 0)
+        detached = res.get("managed_epg_detached", 0)
+        parts = [f"{label}: {total} channels"]
+        if to_hide or to_show:
+            parts.append(f"{to_hide} hide / {to_show} show")
+        if attached or detached:
+            parts.append(f"EPG +{attached}/-{detached}")
+        csv_file = res.get("csv_file")
+        if csv_file and csv_file != "N/A":
+            parts.append(f"CSV: {os.path.basename(csv_file)}")
+        return " | ".join(parts)
 
     def _dry_run_bg(self, settings, logger, result_holder):
-        """Background wrapper for dry_run that stores the result."""
+        """Background wrapper for dry_run; stores the result for the synchronous caller."""
         try:
             result_holder['result'] = self._scan_and_update_channels(settings, logger, dry_run=True)
         except Exception as e:
@@ -2327,47 +2907,57 @@ class Plugin:
             result_holder['result'] = {"status": "error", "message": f"Dry run error: {e}"}
 
     def dry_run_action(self, settings, logger):
-        """Preview channel visibility changes without applying them"""
-        # Use a result holder so the background thread can store its result
+        """Preview channel visibility changes without applying them.
+
+        Runs synchronously. Dispatcharr's action-button loading spinner is
+        the busy indicator; the HTTP response carries a compact one-line
+        summary for the completion notification. The full multi-line
+        `message` that `_scan_and_update_channels` produces stays in logs
+        and CSV headers for diagnostics.
+        """
         result_holder = {}
         if not self._try_start_thread(self._dry_run_bg, (dict(settings), logger, result_holder)):
             return {"status": "error", "message": "Another operation is already running. Please wait for it to finish."}
-
-        # Wait for the dry run to complete (synchronous for the caller)
         logger.info(f"{LOG_PREFIX} Starting dry run scan...")
         self._thread.join()
-        return result_holder.get('result', {"status": "error", "message": "Dry run produced no result."})
+        result = result_holder.get('result', {"status": "error", "message": "Dry run produced no result."})
+        summary = self._compact_scan_summary("Dry run", result)
+        if summary:
+            result["message"] = summary
+        return result
 
-    def _run_now_bg(self, settings, logger):
-        """Background wrapper for run_now to support thread-safe execution."""
+    def _run_now_bg(self, settings, logger, result_holder):
+        """Background wrapper for run_now; stores the result for the synchronous caller."""
         try:
             result = self._scan_and_update_channels(settings, logger, dry_run=False)
             if result.get("status") == "success":
-                results_data = result.get("results", {})
-                if results_data.get("to_hide", 0) > 0 or results_data.get("to_show", 0) > 0:
+                rs = result.get("results", {})
+                if rs.get("to_hide", 0) > 0 or rs.get("to_show", 0) > 0:
                     self._trigger_frontend_refresh(settings, logger)
-            msg = result.get("message", "Done")
-            logger.info(f"{LOG_PREFIX} Run Now completed: {msg}")
-            send_websocket_update('updates', 'update', {
-                "type": "plugin", "plugin": self.name,
-                "message": f"Run Now complete: {msg.split(chr(10))[0]}"
-            })
+            result_holder['result'] = result
+            logger.info(f"{LOG_PREFIX} Run Now completed: {result.get('message', 'Done')}")
         except Exception as e:
             logger.exception(f"{LOG_PREFIX} Run Now error: {e}")
-            send_websocket_update('updates', 'update', {
-                "type": "plugin", "plugin": self.name,
-                "message": f"Run Now error: {e}"
-            })
+            result_holder['result'] = {"status": "error", "message": f"Run Now error: {e}"}
 
     def run_now_action(self, settings, logger):
-        """Immediately scan and update channel visibility (runs as background thread)"""
-        if not self._try_start_thread(self._run_now_bg, (dict(settings), logger)):
+        """Immediately scan and update channel visibility, synchronously.
+
+        Same pattern as dry_run_action: synchronous thread.join so the
+        action-button spinner covers the busy state, and the HTTP response
+        returns a compact one-line summary that renders cleanly in the
+        Dispatcharr notification window.
+        """
+        result_holder = {}
+        if not self._try_start_thread(self._run_now_bg, (dict(settings), logger, result_holder)):
             return {"status": "error", "message": "Another operation is already running. Please wait for it to finish."}
-        return {
-            "status": "success",
-            "message": "Channel visibility update started. Check notifications for progress.",
-            "background": True,
-        }
+        logger.info(f"{LOG_PREFIX} Starting Run Now scan...")
+        self._thread.join()
+        result = result_holder.get('result', {"status": "error", "message": "Run Now produced no result."})
+        summary = self._compact_scan_summary("Run Now", result)
+        if summary:
+            result["message"] = summary
+        return result
 
     def remove_epg_from_hidden_action(self, settings, logger):
         """Remove EPG data from all hidden/disabled channels in the selected profile and set to dummy EPG"""

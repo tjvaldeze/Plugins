@@ -146,6 +146,24 @@ fi
       echo ""
       echo "For help: [Dispatcharr Discord]($DISCORD_URL)"
     fi
+  elif [[ "${CLOSE_REASON:-}" == "author-blacklisted" ]]; then
+    echo ""
+    echo "## PR Closed: Account Restricted"
+    echo ""
+    echo "Your GitHub account (\`$PR_AUTHOR\`) is not permitted to submit plugins to this repository. This PR has been automatically closed."
+    if [[ -n "${DISCORD_URL:-}" ]]; then
+      echo ""
+      echo "If you believe this is an error, please reach out via the [Dispatcharr Discord]($DISCORD_URL)."
+    fi
+  elif [[ "${CLOSE_REASON:-}" == "plugin-blacklisted" ]]; then
+    echo ""
+    echo "## PR Closed: Plugin Restricted"
+    echo ""
+    echo "One or more plugins in this PR are on the restricted list and cannot be submitted to this repository. This PR has been automatically closed."
+    if [[ -n "${DISCORD_URL:-}" ]]; then
+      echo ""
+      echo "If you believe this is an error, please reach out via the [Dispatcharr Discord]($DISCORD_URL)."
+    fi
   elif [[ "$CLOSE_PR" == "true" ]]; then
     echo ""
     echo "## PR Closed: Unauthorized"
@@ -173,12 +191,14 @@ fi
       echo ""
       echo "⚠️ This PR modifies files outside of \`plugins/\`, which requires write access to the repository. These changes will block merging."
       echo ""
+      echo "External contributions to repository tooling and scripts are not accepted via PR. If you think something needs fixing, please [open an issue](https://github.com/${GITHUB_REPOSITORY}/issues/new/choose) instead."
+      echo ""
       echo "**Modified files:**"
       echo "\`\`\`"
       echo "${OUTSIDE_FILES}"
       echo "\`\`\`"
       echo ""
-      echo "Please remove these changes and resubmit with only modifications inside \`plugins/\`."
+      echo "Remove these changes and resubmit with only modifications inside \`plugins/\`."
       if [[ -n "${DISCORD_URL:-}" ]]; then
         echo ""
         echo "For help: [Dispatcharr Discord]($DISCORD_URL)"
@@ -201,7 +221,29 @@ fi
       echo ""
     fi
 
-    # insert --- if there are ANY codeql findings, medium, low, or skip/unscanned notice
+    # insert --- if there are ANY codeql/clamav findings, medium, low, or skip/unscanned notice
+    if [[ -n "${CODEQL_RESULT:-}" && "${CODEQL_RESULT:-}" != "skipped" && "${CODEQL_RESULT:-}" != "success" ]] || \
+       [[ -n "${CODEQL_MEDIUMS:-}" && "${CODEQL_MEDIUMS}" != "0" && "${CODEQL_RESULT:-}" != "skipped" ]] || \
+       [[ -n "${CODEQL_LOWS:-}" && "${CODEQL_LOWS}" != "0" && "${CODEQL_RESULT:-}" != "skipped" ]] || \
+       [[ "${CODEQL_RESULT:-}" == "skipped" && -n "${CODEQL_UNSCANNED_LANGS:-}" ]] || \
+       [[ "${CODEQL_RESULT:-}" != "skipped" && -n "${CODEQL_RESULT:-}" && -n "${CODEQL_UNSCANNED_LANGS:-}" ]] || \
+       [[ "${CLAMAV_RESULT:-}" == "failure" ]]; then
+      echo ""
+      echo "---"
+      echo ""
+    fi
+
+    if [[ "${CLAMAV_RESULT:-}" == "failure" ]]; then
+      OVERALL_FAILED=1
+      INFECTED_LABEL="${CLAMAV_INFECTED:-unknown}"
+      echo ""
+      echo "❌ **ClamAV detected $INFECTED_LABEL infected file(s)**."
+      echo ""
+      if [[ -f "clamav-findings/clamav-findings.md" ]]; then
+        cat "clamav-findings/clamav-findings.md"
+      fi
+    fi
+
     if [[ -n "${CODEQL_RESULT:-}" && "${CODEQL_RESULT:-}" != "skipped" && "${CODEQL_RESULT:-}" != "success" ]] || \
        [[ -n "${CODEQL_MEDIUMS:-}" && "${CODEQL_MEDIUMS}" != "0" && "${CODEQL_RESULT:-}" != "skipped" ]] || \
        [[ -n "${CODEQL_LOWS:-}" && "${CODEQL_LOWS}" != "0" && "${CODEQL_RESULT:-}" != "skipped" ]] || \
@@ -260,6 +302,7 @@ fi
       echo "**Note:** The following bundled file type(s) were not scanned by CodeQL (unsupported language): \`${UNSCANNED_DISPLAY}\`."
       echo ""
     fi
+
     if [[ -n "${TITLE_VALID:-}" && "${TITLE_VALID}" != "true" ]]; then
       echo ""
       echo "---"
@@ -353,7 +396,7 @@ gh pr comment "$PR_NUMBER" --body "$(cat pr_comment.txt)"
 COMMENT_EXIT=$?
 
 # Close PR for unauthorized plugin modifications
-if [[ "$CLOSE_PR" == "true" && "${CLOSE_REASON:-}" == "unauthorized" ]]; then
+if [[ "$CLOSE_PR" == "true" && ( "${CLOSE_REASON:-}" == "unauthorized" || "${CLOSE_REASON:-}" == "author-blacklisted" || "${CLOSE_REASON:-}" == "plugin-blacklisted" ) ]]; then
   gh pr close "$PR_NUMBER"
   echo "PR #$PR_NUMBER closed: unauthorized"
   exit $COMMENT_EXIT

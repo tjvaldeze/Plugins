@@ -1,7 +1,0 @@
-{
-  "name": "Stream Dripper",
-  "version": "1.0.0",
-  "description": "Automatically drops all active streams once per day at a configured time, with a manual drop-now button.",
-  "author": "Megamannen",
-  "license": "Artistic-2.0"
-}

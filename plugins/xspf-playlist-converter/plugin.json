@@ -1,0 +1,8 @@
+{
+  "name": "XSPF Playlist Converter",
+  "version": "1.0.0",
+  "description": "Downloads an XSPF playlist and automatically converts it into a standard M3U format for Dispatcharr.",
+  "author": "tjvaldeze",
+  "license": "MIT",
+  "min_dispatcharr_version": "0.19.0"
+}
